@@ -1128,8 +1128,25 @@ class RawCall(_SimpleBuiltinFunction):
                 expr,
             )
 
-        eval_input_buf = ensure_in_memory(data, context)
-        input_buf = eval_seq(eval_input_buf)
+        if data.value == "~calldata":
+            call_ir = ["with", "mem_ofst", "msize"]
+            args_ofst = ["seq", ["calldatacopy", "mem_ofst", 0, "calldatasize"], "mem_ofst"]
+            args_len = "calldatasize"
+        else:
+            # some gymnastics to propagate constants (if eval_input_buf
+            # returns a static memory location)
+            eval_input_buf = ensure_in_memory(data, context)
+
+            input_buf = eval_seq(eval_input_buf)
+
+            if input_buf is None:
+                call_ir = ["with", "arg_buf", eval_input_buf]
+                input_buf = IRnode.from_list("arg_buf")
+            else:
+                call_ir = ["seq", eval_input_buf]
+
+            args_ofst = add_ofst(input_buf, 32)
+            args_len = ["mload", input_buf]
 
         output_node = IRnode.from_list(
             context.new_internal_variable(ByteArrayType(outsize)),
@@ -1139,16 +1156,10 @@ class RawCall(_SimpleBuiltinFunction):
 
         bool_ty = BaseType("bool")
 
-        if input_buf is None:
-            call_ir = ["with", "arg_buf", eval_input_buf]
-            input_buf = IRnode.from_list("arg_buf")
-        else:
-            call_ir = ["seq", eval_input_buf]
-
         # build IR for call or delegatecall
         common_call_args = [
-            add_ofst(input_buf, 32),
-            ["mload", input_buf],  # buf len
+            args_ofst,
+            args_len,
             # if there is no return value, the return offset can be 0
             add_ofst(output_node, 32) if outsize else 0,
             outsize,
@@ -1160,25 +1171,16 @@ class RawCall(_SimpleBuiltinFunction):
             call_op = ["staticcall", gas, to, *common_call_args]
         else:
             call_op = ["call", gas, to, value, *common_call_args]
+
         call_ir += [call_op]
 
         # build sequence IR
         if outsize:
             # return minimum of outsize and returndatasize
-            size = [
-                "with",
-                "_l",
-                outsize,
-                ["with", "_r", "returndatasize", ["if", ["gt", "_l", "_r"], "_r", "_l"]],
-            ]
+            size = ["select", ["lt", outsize, "returndatasize"], outsize, "returndatasize"]
 
             # store output size and return output location
-            store_output_size = [
-                "with",
-                "output_pos",
-                output_node,
-                ["seq", ["mstore", "output_pos", size], "output_pos"],
-            ]
+            store_output_size = ["seq", ["mstore", output_node, size], output_node]
 
             bytes_ty = ByteArrayType(outsize)
 
@@ -2053,6 +2055,95 @@ class ABIEncode(_SimpleBuiltinFunction):
             typ=buf_t,
             annotation=f"abi_encode builtin ensure_tuple={self._ensure_tuple(expr)}",
         )
+
+
+class ABIDecode(_SimpleBuiltinFunction):
+    _id = "_abi_decode"
+    _inputs = [("data", BytesArrayPrimitive()), ("output_type", "TYPE_DEFINITION")]
+    _kwargs = {"unwrap_tuple": KwargSettings(BoolDefinition(), True, require_literal=True)}
+
+    def fetch_call_return(self, node):
+        _, output_type = self.infer_arg_types(node)
+        return output_type.typedef
+
+    def infer_arg_types(self, node):
+        validate_call_args(node, 2, ["unwrap_tuple"])
+
+        data_type = get_exact_type_from_node(node.args[0])
+        output_typedef = TypeTypeDefinition(
+            get_type_from_annotation(node.args[1], DataLocation.MEMORY)
+        )
+
+        return [data_type, output_typedef]
+
+    @validate_inputs
+    def build_IR(self, expr, args, kwargs, context):
+        unwrap_tuple = kwargs["unwrap_tuple"]
+
+        data = args[0]
+        output_typ = args[1]
+        wrapped_typ = output_typ
+
+        if unwrap_tuple is True:
+            wrapped_typ = calculate_type_for_external_return(output_typ)
+
+        abi_size_bound = wrapped_typ.abi_type.size_bound()
+        abi_min_size = wrapped_typ.abi_type.min_size()
+
+        # Get the size of data
+        input_max_len = data.typ.maxlen
+
+        assert abi_min_size <= abi_size_bound, "bad abi type"
+        if input_max_len < abi_size_bound:
+            raise StructureException(
+                (
+                    "Mismatch between size of input and size of decoded types. "
+                    f"length of ABI-encoded {wrapped_typ} must be equal to or greater "
+                    f"than {abi_size_bound}"
+                ),
+                expr.args[0],
+            )
+
+        data = ensure_in_memory(data, context)
+        with data.cache_when_complex("to_decode") as (b1, data):
+
+            data_ptr = bytes_data_ptr(data)
+            data_len = get_bytearray_length(data)
+
+            # Normally, ABI-encoded data assumes the argument is a tuple
+            # (See comments for `wrap_value_for_external_return`)
+            # However, we do not want to use `wrap_value_for_external_return`
+            # technique as used in external call codegen because in order to be
+            # type-safe we would need an extra memory copy. To avoid a copy,
+            # we manually add the ABI-dynamic offset so that it is
+            # re-interpreted in-place.
+            if (
+                unwrap_tuple is True
+                and needs_external_call_wrap(output_typ)
+                and output_typ.abi_type.is_dynamic()
+            ):
+                data_ptr = add_ofst(data_ptr, 32)
+
+            ret = ["seq"]
+
+            if abi_min_size == abi_size_bound:
+                ret.append(["assert", ["eq", abi_min_size, data_len]])
+            else:
+                # runtime assert: abi_min_size <= data_len <= abi_size_bound
+                ret.append(clamp2(abi_min_size, data_len, abi_size_bound, signed=False))
+
+            # return pointer to the buffer
+            ret.append(data_ptr)
+
+            return b1.resolve(
+                IRnode.from_list(
+                    ret,
+                    typ=output_typ,
+                    location=data.location,
+                    encoding=Encoding.ABI,
+                    annotation=f"abi_decode({output_typ})",
+                )
+            )
 
 
 DISPATCH_TABLE = {
