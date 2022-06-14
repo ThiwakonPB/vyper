@@ -18,6 +18,7 @@ from vyper.codegen.core import (
     bytes_data_ptr,
     check_external_call,
     clamp,
+    calculate_type_for_external_return,
     clamp2,
     clamp_basetype,
     copy_bytes,
@@ -26,10 +27,12 @@ from vyper.codegen.core import (
     get_bytearray_length,
     get_element_ptr,
     ir_tuple_from_args,
+    needs_external_call_wrap,
     promote_signed_int,
     unwrap_location,
 )
 from vyper.codegen.expr import Expr
+from vyper.codegen.ir_node import Encoding
 from vyper.codegen.keccak256_helper import keccak256_helper
 from vyper.codegen.types import (
     BaseType,
@@ -67,7 +70,7 @@ from vyper.semantics.types.abstract import (
 )
 from vyper.semantics.types.bases import DataLocation, ValueTypeDefinition
 from vyper.semantics.types.indexable.sequence import ArrayDefinition
-from vyper.semantics.types.utils import get_type_from_annotation
+from vyper.semantics.types.utils import KwargSettings, TypeTypeDefinition,get_type_from_annotation
 from vyper.semantics.types.value.address import AddressDefinition
 from vyper.semantics.types.value.array_value import (
     BytesArrayDefinition,
@@ -2057,7 +2060,7 @@ class ABIEncode(_SimpleBuiltinFunction):
         )
 
 
-class ABIDecode(_SimpleBuiltinFunction):
+class ABIDecode(_SimpleBuiltinFunction):    
     _id = "_abi_decode"
     _inputs = [("data", BytesArrayPrimitive()), ("output_type", "TYPE_DEFINITION")]
     _kwargs = {"unwrap_tuple": KwargSettings(BoolDefinition(), True, require_literal=True)}
